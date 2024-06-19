@@ -18,6 +18,8 @@
 
 #include <time.h>
 #include <stdlib.h>
+#include <locale>
+#include <codecvt>
 
 #include "odbc.h"
 #include "odbc_connection.h"
@@ -182,6 +184,19 @@ Napi::Value ODBC::Init(Napi::Env env, Napi::Object exports) {
   return exports;
 }
 
+// Convert UTF-16 to UTF-8
+std::string utf16_to_utf8(const std::u16string &utf16) {
+  std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> convert;
+  return convert.to_bytes(utf16);
+}
+
+// Convert UTF-8 to UTF-16
+std::u16string utf8_to_utf16(const std::string &utf8) {
+  std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> convert;
+  return convert.from_bytes(utf8);
+}
+
+
 ODBC::~ODBC() {
 
   uv_mutex_lock(&ODBC::g_odbcMutex);
@@ -270,29 +285,14 @@ void ODBCAsyncWorker::OnError(const Napi::Error &e) {
 // After a SQL Function doesn't pass SQL_SUCCEEDED, the handle type and handle
 // are sent to this function, which gets the information and stores it in an
 // array of ODBCErrors
-ODBCError* ODBCAsyncWorker::GetODBCErrors
-(
-  SQLSMALLINT handleType,
-  SQLHANDLE handle
-) 
-{
+ODBCError* ODBCAsyncWorker::GetODBCErrors(SQLSMALLINT handleType, SQLHANDLE handle) {
   SQLRETURN return_code;
   SQLSMALLINT error_message_length = ERROR_MESSAGE_BUFFER_CHARS;
   SQLINTEGER statusRecCount;
 
-  return_code = SQLGetDiagField
-  (
-    handleType,      // HandleType
-    handle,          // Handle
-    0,               // RecNumber
-    SQL_DIAG_NUMBER, // DiagIdentifier
-    &statusRecCount, // DiagInfoPtr
-    SQL_IS_INTEGER,  // BufferLength
-    NULL             // StringLengthPtr
-  );
+  return_code = SQLGetDiagField(handleType, handle, 0, SQL_DIAG_NUMBER, &statusRecCount, SQL_IS_INTEGER, NULL);
 
-  if (!SQL_SUCCEEDED(return_code))
-  {
+  if (!SQL_SUCCEEDED(return_code)) {
     ODBCError *odbcErrors = new ODBCError[1];
     ODBCError error;
     error.state[0] = NO_STATE_TEXT;
@@ -307,31 +307,15 @@ ODBCError* ODBCAsyncWorker::GetODBCErrors
   this->errorCount = statusRecCount;
 
   for (SQLSMALLINT i = 0; i < statusRecCount; i++) {
-
     ODBCError error;
-
     SQLSMALLINT new_error_message_length;
     return_code = SQL_SUCCESS;
 
-    while(SQL_SUCCEEDED(return_code))
-    {
+    while(SQL_SUCCEEDED(return_code)) {
       error.message = new SQLTCHAR[error_message_length];
+      return_code = SQLGetDiagRec(handleType, handle, i + 1, error.state, &error.code, error.message, error_message_length, &new_error_message_length);
 
-      return_code =
-      SQLGetDiagRec
-      (
-        handleType,                // HandleType
-        handle,                    // Handle
-        i + 1,                     // RecNumber
-        error.state,               // SQLState
-        &error.code,               // NativeErrorPtr
-        error.message,             // MessageText
-        error_message_length,      // BufferLength
-        &new_error_message_length  // TextLengthPtr
-      );
-
-      if (error_message_length > new_error_message_length)
-      {
+      if (error_message_length > new_error_message_length) {
         break;
       }
 
@@ -339,18 +323,25 @@ ODBCError* ODBCAsyncWorker::GetODBCErrors
       error_message_length = new_error_message_length + 1;
     }
 
-    if (!SQL_SUCCEEDED(return_code))
-    {
+    if (!SQL_SUCCEEDED(return_code)) {
       error.state[0] = NO_STATE_TEXT;
       error.code = 0;
       memcpy(error.message, NO_MSG_TEXT, NO_MSG_TEXT_SIZE + 1); 
     }
+
+    std::u16string utf16Message(reinterpret_cast<char16_t*>(error.message));
+    std::string utf8Message = utf16_to_utf8(utf16Message);
+
+    delete[] error.message;
+    error.message = new SQLTCHAR[utf8Message.length() + 1];
+    memcpy(error.message, utf8Message.c_str(), utf8Message.length() + 1);
 
     odbcErrors[i] = error;
   }
 
   return odbcErrors;
 }
+
 
 // TODO: Documentation for this function
 bool ODBCAsyncWorker::CheckAndHandleErrors(SQLRETURN return_code, SQLSMALLINT handleType, SQLHANDLE handle, const char *message) {
@@ -693,21 +684,18 @@ SQLTCHAR* ODBC::NapiStringToSQLTCHAR(Napi::String string) {
 // values to bind to parameters must be saved off in the closest, largest data type to then
 // convert to the right C Type once the SQL Type of the parameter is known.
 void ODBC::StoreBindValues(Napi::Array *values, Parameter **parameters) {
-
   uint32_t numParameters = values->Length();
 
   for (uint32_t i = 0; i < numParameters; i++) {
-
     Napi::Value value = values->Get(i);
     Parameter *parameter = parameters[i];
 
-    if(value.IsNull()) {
+    if (value.IsNull()) {
       parameter->ValueType = SQL_C_DEFAULT;
       parameter->ParameterValuePtr = NULL;
       parameter->StrLen_or_IndPtr = SQL_NULL_DATA;
 #if NAPI_VERSION > 5
     } else if (value.IsBigInt()) {
-      // TODO: need to check for signed/unsigned?
       bool lossless = true;
       parameter->ValueType = SQL_C_SBIGINT;
       parameter->ParameterValuePtr = new SQLBIGINT(value.As<Napi::BigInt>().Int64Value(&lossless));
@@ -742,23 +730,20 @@ void ODBC::StoreBindValues(Napi::Array *values, Parameter **parameters) {
       parameter->StrLen_or_IndPtr = parameter->BufferLength;
       memcpy((SQLCHAR *) parameter->ParameterValuePtr, arrayBufferValue.Data(), parameter->BufferLength);
     } else if (value.IsString()) {
-      // Napi::String string = value.ToString();
-      // parameter->ValueType = SQL_C_WCHAR;
-      // parameter->BufferLength = (string.Utf16Value().length() + 1) * sizeof(SQLWCHAR);
-      // parameter->ParameterValuePtr = new SQLWCHAR[parameter->BufferLength];
-      // parameter->StrLen_or_IndPtr = SQL_NTS;
-      // memcpy((SQLWCHAR*) parameter->ParameterValuePtr, string.Utf16Value().c_str(), parameter->BufferLength);
       Napi::String string = value.ToString();
-      parameter->ValueType = SQL_C_CHAR;
-      parameter->BufferLength = (string.Utf8Value().length() + 1);
-      parameter->ParameterValuePtr = new SQLCHAR[parameter->BufferLength]();
+      std::string utf8String = string.Utf8Value();
+      std::u16string utf16String = utf8_to_utf16(utf8String);
+      parameter->ValueType = SQL_C_WCHAR;
+      parameter->BufferLength = (utf16String.length() + 1) * sizeof(SQLWCHAR);
+      parameter->ParameterValuePtr = new SQLWCHAR[parameter->BufferLength];
       parameter->StrLen_or_IndPtr = SQL_NTS;
-      memcpy((SQLCHAR*) parameter->ParameterValuePtr, string.Utf8Value().c_str(), parameter->BufferLength);
+      memcpy((SQLWCHAR*) parameter->ParameterValuePtr, utf16String.c_str(), parameter->BufferLength);
     } else {
       // TODO: Throw error, don't support other types
     }
   }
 }
+
 
 SQLRETURN ODBC::DescribeParameters(SQLHSTMT hstmt, Parameter **parameters, SQLSMALLINT parameterCount) {
 
